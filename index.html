@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/><title>Nifty 500 Screener</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>html,body{margin:0;padding:0;background:#0d1420}#root{min-height:100vh}</style>
+</head><body><div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useEffect } = React;
+
+/* Data loads at runtime from data/data.json, refreshed by the scheduled job. */
+let STOCKS=[]; let ASOF=""; let GENERATED="";
+/* ================================ maths ================================ */
+const TD=252;
+function erf(x){const t=1/(1+0.3275911*Math.abs(x));const y=1-(((((1.061405429*t-1.453152027)*t)+1.421413741)*t-0.284496736)*t+0.254829592)*t*Math.exp(-x*x);return x>=0?y:-y;}
+const normCdf=x=>0.5*(1+erf(x/Math.SQRT2));
+const normPdf=x=>Math.exp(-0.5*x*x)/Math.sqrt(2*Math.PI);
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function stats(closes){
+  const r=[];for(let i=1;i<closes.length;i++)r.push(Math.log(closes[i]/closes[i-1]));
+  const n=r.length,mean=r.reduce((a,b)=>a+b,0)/n,varr=r.reduce((a,b)=>a+(b-mean)**2,0)/(n-1),sd=Math.sqrt(varr);
+  const m3=r.reduce((a,b)=>a+(b-mean)**3,0)/n,m4=r.reduce((a,b)=>a+(b-mean)**4,0)/n;
+  const se=sd/Math.sqrt(n);
+  return{r,n,mean,sd,skew:m3/sd**3,exk:m4/sd**4-3,se,hitUp:r.filter(x=>x>0).length/n,volAnn:sd*Math.sqrt(TD),ciLo:mean-1.96*se,ciHi:mean+1.96*se};
+}
+function ouFit(closes){
+  const lp=closes.map(Math.log),y=[],x=[];for(let i=1;i<lp.length;i++){y.push(lp[i]-lp[i-1]);x.push(lp[i-1]);}
+  const n=x.length,mx=x.reduce((a,b)=>a+b,0)/n,my=y.reduce((a,b)=>a+b,0)/n;let sxy=0,sxx=0;
+  for(let i=0;i<n;i++){sxy+=(x[i]-mx)*(y[i]-my);sxx+=(x[i]-mx)**2;}
+  const b=sxy/sxx,a=my-b*mx,theta=-b;if(theta<=0)return{reverting:false,hl:null,mean:null};
+  return{reverting:true,hl:Math.log(2)/theta,mean:Math.exp(a/theta)};
+}
+function corwinSchultz(H,L){
+  if(!H||H.some(v=>v==null)||L.some(v=>v<=0)||H.length<3)return null;
+  const k=3-2*Math.sqrt(2),s=[];
+  for(let i=0;i<H.length-1;i++){const hl=Math.log(H[i]/L[i])**2+Math.log(H[i+1]/L[i+1])**2;
+    const H2=Math.max(H[i],H[i+1]),L2=Math.min(L[i],L[i+1]);const g=Math.log(H2/L2)**2;
+    let al=(Math.sqrt(2*hl)-Math.sqrt(hl))/k-Math.sqrt(g/k);al=Math.max(0,al);
+    const sp=2*(Math.exp(al)-1)/(1+Math.exp(al));if(isFinite(sp))s.push(sp);}
+  return s.length?s.reduce((a,b)=>a+b,0)/s.length:null;
+}
+function gbmProb(S0,tgt,mu,sd,T){
+  const nu=mu-0.5*sd*sd,b=Math.log(tgt/S0),sT=sd*Math.sqrt(T);
+  if(sT===0)return{touch:tgt===S0?1:0,finish:NaN};if(Math.abs(b)<1e-12)return{touch:1,finish:0.5};
+  let touch,finish;
+  if(b>0){touch=normCdf((-b+nu*T)/sT)+Math.exp(2*nu*b/(sd*sd))*normCdf((-b-nu*T)/sT);finish=normCdf((nu*T-b)/sT);}
+  else{touch=normCdf((b-nu*T)/sT)+Math.exp(2*nu*b/(sd*sd))*normCdf((b+nu*T)/sT);finish=normCdf((b-nu*T)/sT);}
+  return{touch:Math.min(1,Math.max(0,touch)),finish:Math.min(1,Math.max(0,finish))};
+}
+function monteCarlo(S0,tgt,returns,T,paths=8000,keep=60){
+  const rng=mulberry32(7),up=tgt>S0,lt=Math.log(tgt);let touched=0;const sample=[];
+  for(let p=0;p<paths;p++){let lp=Math.log(S0),mx=lp,mn=lp;const path=(p<keep)?[S0]:null;
+    for(let d=0;d<T;d++){lp+=returns[Math.floor(rng()*returns.length)];mx=Math.max(mx,lp);mn=Math.min(mn,lp);if(path)path.push(Math.exp(lp));}
+    if(up?mx>=lt:mn<=lt)touched++;if(path)sample.push({path,hit:up?mx>=lt:mn<=lt});}
+  return{prob:touched/paths,sample};
+}
+const COST_FLOOR_BPS=28.82; // delivery round-trip (Indian stack)
+const NIFTY=[23622.9,23853.9,23989.15,24085.7,24168.0,24013.1,24102.9,23824.1,24021.65,24056.0,23946.25,23865.75,24005.85,24175.7,24270.85,24430.35,24398.7,23882.05,23962.8,24206.9,24211.0,24052.05,24078.5,24072.75,24334.3,24238.5,23869.6,23767.45,23995.95,23985.35,24250.2,24317.15,24774.3,24614.9,24624.65,24636.0,24570.65,24583.8,24471.7,24435.95,24395.85,24366.0,24287.65,24154.9,24078.3];
+const NIFTY_R=(function(){const r=[];for(let i=1;i<NIFTY.length;i++)r.push(Math.log(NIFTY[i]/NIFTY[i-1]));return r;})();
+
+// --- trend authenticity ---
+function efficiencyRatio(c,win){ // Kaufman: net move / total path. 1=clean trend, ~0=chop
+  const s=c.slice(-Math.min(win,c.length-1)-1);let path=0;for(let i=1;i<s.length;i++)path+=Math.abs(s[i]-s[i-1]);
+  const net=Math.abs(s[s.length-1]-s[0]);return path>0?net/path:0;
+}
+function varianceRatio(r,k){ // Lo-MacKinlay VR(k): >1 trending/persistent, <1 mean-reverting, ~1 random walk
+  const n=r.length;if(n<k+2)return 1;const mu=r.reduce((a,b)=>a+b,0)/n;
+  let v1=0;for(const x of r)v1+=(x-mu)**2;v1/=(n-1);
+  let vk=0,cnt=0;for(let i=0;i+k<=n;i++){let s=0;for(let j=0;j<k;j++)s+=r[i+j]-mu;vk+=s*s;cnt++;}
+  vk/=(cnt*k);return v1>0?vk/v1:1;
+}
+function slopeStats(c){ // regress log price on time; return t-stat of slope and R^2
+  const y=c.map(Math.log),n=y.length,xs=[...Array(n).keys()];
+  const mx=(n-1)/2,my=y.reduce((a,b)=>a+b,0)/n;let sxy=0,sxx=0,syy=0;
+  for(let i=0;i<n;i++){sxy+=(xs[i]-mx)*(y[i]-my);sxx+=(xs[i]-mx)**2;syy+=(y[i]-my)**2;}
+  const b=sxy/sxx,r2=syy>0?(sxy*sxy)/(sxx*syy):0;
+  let sse=0;for(let i=0;i<n;i++){const pred=my+b*(xs[i]-mx);sse+=(y[i]-pred)**2;}
+  const se=Math.sqrt((sse/(n-2))/sxx),t=se>0?b/se:0;return{t,r2,slope:b};
+}
+
+// --- volatility estimators ---
+function parkinsonVol(H,L){ // high-low range estimator (more efficient than close-close)
+  let s=0,n=0;for(let i=0;i<H.length;i++){if(H[i]>0&&L[i]>0){s+=Math.log(H[i]/L[i])**2;n++;}}
+  return n?Math.sqrt(s/(n*4*Math.log(2)))*Math.sqrt(TD):null;
+}
+function ewmaVol(r,lam){ // RiskMetrics EWMA, recent-weighted
+  let v=r[0]*r[0];for(let i=1;i<r.length;i++)v=lam*v+(1-lam)*r[i]*r[i];return Math.sqrt(v)*Math.sqrt(TD);
+}
+function atrPct(H,L,C){ // average true range as % of price
+  let s=0,n=0;for(let i=1;i<C.length;i++){const tr=Math.max(H[i]-L[i],Math.abs(H[i]-C[i-1]),Math.abs(L[i]-C[i-1]));s+=tr;n++;}
+  const atr=n?s/n:0;return C[C.length-1]>0?atr/C[C.length-1]:0;
+}
+function downsideDev(r){const d=r.filter(x=>x<0);if(!d.length)return 0;return Math.sqrt(d.reduce((a,b)=>a+b*b,0)/d.length)*Math.sqrt(TD);}
+function maxDrawdown(c){let peak=c[0],mdd=0;for(const p of c){if(p>peak)peak=p;const dd=p/peak-1;if(dd<mdd)mdd=dd;}return mdd;}
+function betaCorr(r,mkt){ // align trailing, beta & correlation to market
+  const k=Math.min(r.length,mkt.length);if(k<5)return{beta:null,corr:null};
+  const a=r.slice(-k),b=mkt.slice(-k);const ma=a.reduce((x,y)=>x+y,0)/k,mb=b.reduce((x,y)=>x+y,0)/k;
+  let cov=0,va=0,vb=0;for(let i=0;i<k;i++){cov+=(a[i]-ma)*(b[i]-mb);va+=(a[i]-ma)**2;vb+=(b[i]-mb)**2;}
+  return{beta:vb>0?cov/vb:null,corr:(va>0&&vb>0)?cov/Math.sqrt(va*vb):null};
+}
+// Probability CI: repeat the bootstrap in independent blocks and take the
+// spread of block estimates. A wide band means the estimate is not trustworthy
+// — showing that is more honest than a single confident-looking number.
+function touchWithCI(S0,tgt,r,T,blocks=8,perBlock=400){
+  const est=[];
+  for(let b=0;b<blocks;b++){
+    const rng=mulberry32(1000+b*37),up=tgt>S0,lt=Math.log(tgt);let hit=0;
+    for(let p=0;p<perBlock;p++){let lp=Math.log(S0),mx=lp,mn=lp;
+      for(let d=0;d<T;d++){lp+=r[Math.floor(rng()*r.length)];if(lp>mx)mx=lp;if(lp<mn)mn=lp;}
+      if(up?mx>=lt:mn<=lt)hit++;}
+    est.push(hit/perBlock);
+  }
+  const m=est.reduce((a,b)=>a+b,0)/est.length;
+  const sd=Math.sqrt(est.reduce((a,b)=>a+(b-m)**2,0)/(est.length-1));
+  const se=sd/Math.sqrt(est.length);
+  return {p:m,lo:Math.max(0,m-1.96*se),hi:Math.min(1,m+1.96*se),se};
+}
+function bootstrapTouch(S0,tgt,r,T,paths){ // fat-tail-aware P(touch) by resampling real returns
+  const rng=mulberry32(7),up=tgt>S0,lt=Math.log(tgt);let hit=0;
+  for(let p=0;p<paths;p++){let lp=Math.log(S0),mx=lp,mn=lp;
+    for(let d=0;d<T;d++){lp+=r[Math.floor(rng()*r.length)];if(lp>mx)mx=lp;if(lp<mn)mn=lp;}
+    if(up?mx>=lt:mn<=lt)hit++;}
+  return hit/paths;
+}
+
+/* one full analysis for a stock */
+function analyse(stock,horizon){
+  const all=stock.c, n=all.length;                    // full ~1y of closes
+  const closes=all.slice(-30), H=stock.h.slice(-30), L=stock.l.slice(-30);
+  const S0=closes[closes.length-1];
+  const rAll=[];for(let i=1;i<all.length;i++)rAll.push(Math.log(all[i]/all[i-1]));
+  // Long-window stats (whole year) drive vol/probability; the 30d window is
+  // kept only for the "stretch vs its recent month" z-score.
+  const st=stats(all);
+  const st30=stats(closes);
+  const ou=ouFit(all.slice(-Math.min(120,n)));        // reversion on 6 months
+  const meanPrice=closes.reduce((a,b)=>a+b,0)/closes.length;   // 30d mean for z-score
+  const band=Math.sqrt(closes.reduce((a,b)=>a+(b-meanPrice)**2,0)/(closes.length-1));
+  const z=(S0-meanPrice)/band;
+  const genuine=ou.reverting&&ou.mean&&ou.hl<=40;
+  const target=genuine?ou.mean:S0*Math.exp(st.mean*horizon);
+  const gbm=gbmProb(S0,target,st.mean,st.sd,horizon);
+  const ci=touchWithCI(S0,target,st.r,horizon);                 // headline + honest error band
+  const pBoot=ci.p;
+  const spread=corwinSchultz(H,L);
+  const bandBps=(Math.exp(st.sd*Math.sqrt(horizon))-Math.exp(-st.sd*Math.sqrt(horizon)))*10000;
+  const clears=bandBps>2*COST_FLOOR_BPS;
+
+  // --- trend authenticity ---
+  const er=efficiencyRatio(all,20);
+  const vr=varianceRatio(rAll,5);
+  const sl=slopeStats(all.slice(-Math.min(30,n)));
+  const trendUp=sl.slope>0;
+  let trend,trendScore;
+  const sig=Math.abs(sl.t)>2, eff=er>0.30;
+  // TQ: efficiency + slope significance dominate; persistence a bonus. 0=pure chop,100=clean significant trend.
+  trendScore=Math.round(Math.max(0,Math.min(100, 45*er + 35*Math.min(1,Math.abs(sl.t)/3) + 20*Math.min(1,Math.max(0,(vr-0.85)/0.4)) )));
+  if(sig&&eff) trend=trendUp?"Genuine ↑":"Genuine ↓";
+  else if(er<0.25) trend="Choppy (fake)";                                   // motion without net direction
+  else if(ou.reverting&&ou.hl!=null&&ou.hl<=25&&vr<0.95) trend="Mean-revert"; // genuine fast reversion
+  else trend="Weak/Random";
+
+  // --- volatility estimators ---
+  const vol30=st30.volAnn;                                      // recent-month vol for regime compare
+  const parkVol=parkinsonVol(H,L);
+  const ewVol=ewmaVol(rAll,0.94);
+  const volRegime=ewVol&&st.volAnn?ewVol/st.volAnn:1;   // >1 vol rising vs 1y mean
+  const atr=atrPct(H,L,closes);
+  const dDev=downsideDev(st.r);
+  const mdd=maxDrawdown(all.slice(-Math.min(45,n)));
+
+  // --- ratios ---
+  const sharpe=st.sd>0?(st.mean/st.sd)*Math.sqrt(TD):0;
+  const sortino=dDev>0?(st.mean*TD)/dDev:0;
+  const bc={beta:(stock.b==null?null:stock.b),corr:(stock.cr==null?null:stock.cr)};
+
+  const trending=!ou.reverting||(ou.hl!=null&&ou.hl>40);
+  return {t:stock.t,cap:stock.cap,ind:stock.ind,name:stock.t.replace(".NS",""),S0,meanPrice,z,volAnn:st.volAnn,exk:st.exk,skew:st.skew,
+    target,pTarget:pBoot,pGbm:gbm.touch,spread,bandBps,clears,trending,hl:ou.hl,ouMean:ou.mean,genuine,
+    tgtDist:target/S0-1,st,closes,H,L,hitUp:st.hitUp,meanDaily:st.mean,sd:st.sd,band,all,
+    pLo:ci.lo,pHi:ci.hi,pSe:ci.se,nBars:n,vol30,
+    er,vr,slopeT:sl.t,r2:sl.r2,trend,trendScore,trendUp,
+    parkVol,ewVol,volRegime,atr,dDev,mdd,sharpe,sortino,beta:bc.beta,corr:bc.corr};
+}
+
+/* =============================== helpers ================================= */
+const fmt=(x,d=2)=>x==null||!isFinite(x)?"–":x.toLocaleString("en-IN",{minimumFractionDigits:d,maximumFractionDigits:d});
+const pct=(x,d=1)=>x==null||!isFinite(x)?"–":(x*100).toFixed(d)+"%";
+const sgn=(x,d=2)=>(x>=0?"+":"")+fmt(x,d);
+function parseInput(text,newestFirst){
+  const bars=[];
+  for(let line of text.split(/\r?\n/)){line=line.trim();if(!line)continue;
+    line=line.replace(/\b\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\b/g," ").replace(/\b\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}\b/g," ");
+    const nums=(line.match(/-?\d+(?:\.\d+)?/g)||[]).map(Number).filter(v=>isFinite(v));
+    if(nums.length>=4){const[o,h,l,c]=nums.slice(0,4);bars.push({h,l,c});}
+    else if(nums.length>=1){bars.push({h:null,l:null,c:nums[nums.length-1]});}}
+  return newestFirst?bars.reverse():bars;
+}
+
+/* ================================ UI ================================ */
+const CAPCOLOR={Large:"var(--data)",Mid:"var(--signal)",Small:"var(--warn)"};
+const COLS=[
+  {k:"name",label:"Ticker",num:false},
+  {k:"cap",label:"Cap",fmt:r=>r.cap,accent:r=>CAPCOLOR[r.cap]},
+  {k:"ind",label:"Sector",num:false,fmt:r=>r.ind},
+  {k:"S0",label:"Spot",fmt:r=>"₹"+fmt(r.S0)},
+  {k:"z",label:"z vs mean",fmt:r=>sgn(r.z)+"σ",accent:r=>Math.abs(r.z)>1.5?"var(--signal)":null},
+  {k:"volAnn",label:"Ann vol",fmt:r=>pct(r.volAnn,0)},
+  {k:"target",label:"Target",fmt:r=>"₹"+fmt(r.target)},
+  {k:"tgtDist",label:"Δ target",fmt:r=>sgn(r.tgtDist*100,1)+"%",accent:r=>r.tgtDist>=0?"var(--data)":"var(--warn)"},
+  {k:"pTarget",label:"P(touch)",fmt:r=>pct(r.pTarget,0)+" ±"+((r.pHi-r.pLo)/2*100).toFixed(0)},
+  {k:"spread",label:"Spread",fmt:r=>r.spread==null?"–":pct(r.spread,2)},
+  {k:"beta",label:"β",fmt:r=>r.beta==null?"–":fmt(r.beta,2),accent:r=>r.beta!=null&&r.beta>1.2?"var(--signal)":null},
+  {k:"trend",label:"Trend",fmt:r=>r.trend,accent:r=>r.trend.startsWith("Genuine ↑")?"var(--data)":r.trend.startsWith("Genuine ↓")?"var(--warn)":r.trend==="Mean-revert"?"var(--signal)":"var(--muted)"},
+  {k:"trendScore",label:"TQ",fmt:r=>r.trendScore},
+  {k:"clears",label:"Cost",fmt:r=>r.clears?"clears":"inside",accent:r=>r.clears?"var(--data)":"var(--warn)"},
+];
+
+function App(){
+  const [horizon,setHorizon]=useState(10);
+  const [sortK,setSortK]=useState("z");
+  const [asc,setAsc]=useState(false);
+  const [filter,setFilter]=useState("all");
+  const [capf,setCapf]=useState("all");
+  const [page,setPage]=useState(0);
+  const [sel,setSel]=useState(null);
+  const [q,setQ]=useState("");
+  const [mounted,setMounted]=useState(false);
+  const [data,setData]=useState(null);
+  const [loadErr,setLoadErr]=useState("");
+  const [refreshing,setRefreshing]=useState(false);
+  const PAGE=50;
+
+  async function loadData(){
+    setRefreshing(true);
+    try{
+      const res=await fetch("data/data.json?ts="+Date.now(),{cache:"no-store"});
+      if(!res.ok)throw new Error("HTTP "+res.status);
+      const j=await res.json();
+      if(!j||!Array.isArray(j.stocks)||!j.stocks.length)throw new Error("data.json has no stocks");
+      STOCKS=j.stocks; ASOF=j.asof||""; GENERATED=j.generated_utc||"";
+      setData(j); setLoadErr("");
+    }catch(e){
+      setLoadErr("Couldn't load data/data.json ("+e.message+"). If you opened this file directly from disk, browsers block local fetch — use your GitHub Pages link instead.");
+    }
+    setRefreshing(false);
+  }
+  useEffect(()=>{setMounted(true);loadData();},[]);
+  useEffect(()=>{const id=setInterval(loadData,5*60*1000);return()=>clearInterval(id);},[]);
+
+  const rows=useMemo(()=>(data?data.stocks:[]).map(s=>analyse(s,horizon)),[data,horizon]);
+  const asof=data?data.asof:"";
+
+  const filtered=useMemo(()=>{
+    let f=rows;
+    if(capf!=="all")f=f.filter(r=>r.cap===capf);
+    if(filter==="clears")f=f.filter(r=>r.clears);
+    else if(filter==="revert")f=f.filter(r=>!r.trending);
+    else if(filter==="stretched")f=f.filter(r=>Math.abs(r.z)>1.5);
+    if(q.trim())f=f.filter(r=>r.name.toLowerCase().includes(q.trim().toLowerCase()));
+    const dir=asc?1:-1;
+    return [...f].sort((a,b)=>{
+      if(sortK==="name")return dir*a.name.localeCompare(b.name);
+      if(sortK==="trend")return dir*a.trend.localeCompare(b.trend);
+      if(sortK==="clears")return dir*((a.clears?1:0)-(b.clears?1:0));
+      const av=a[sortK],bv=b[sortK];
+      return dir*((av==null?-1e9:av)-(bv==null?-1e9:bv));
+    });
+  },[rows,filter,capf,q,sortK,asc]);
+
+  const nLarge=rows.filter(r=>r.cap==="Large").length,nMid=rows.filter(r=>r.cap==="Mid").length,nSmall=rows.filter(r=>r.cap==="Small").length;
+  const nClears=rows.filter(r=>r.clears).length, nStretched=rows.filter(r=>Math.abs(r.z)>1.5).length;
+  useEffect(()=>{setPage(0);},[filter,capf,q,sortK,asc,horizon]);
+  const pageCount=Math.max(1,Math.ceil(filtered.length/PAGE));
+  const pageRows=filtered.slice(page*PAGE,(page+1)*PAGE);
+  const chatCtx=useMemo(()=>buildContext(rows,filtered,sel,capf,sortK,asc,horizon,asof),[rows,filtered,sel,capf,sortK,asc,horizon,asof]);
+  function clickSort(k){if(sortK===k)setAsc(!asc);else{setSortK(k);setAsc(false);}}
+
+  if(!data){
+    return (<div className="root"><style>{CSS}</style><div className="wrap in">
+      <div className="panel loadbox">
+        <div className="eyebrow">NIFTY 500 SCREENER</div>
+        {loadErr
+          ? <><div className="loadmsg err">{loadErr}</div><button className="go" onClick={loadData}>Retry</button></>
+          : <div className="loadmsg">Loading latest data…</div>}
+      </div></div></div>);
+  }
+  return (<div className="root"><style>{CSS}</style>
+    <div className={"wrap"+(mounted?" in":"")}>
+      <header className="hd">
+        <div><div className="eyebrow">NIFTY 500 SCREENER · STOCHASTIC VARIANCE & TARGET · CAP-CLASSIFIED</div>
+          <div className="tk">{rows.length} stocks <span className="tkn">NSE · Large/Mid/Small · 1-year history · as of {asof}</span></div>
+          <div className="asof">Auto-updating · data as of <b>{asof}</b>{GENERATED?" · pulled "+GENERATED.replace("T"," ").replace("+00:00"," UTC"):""} · {horizon}-day horizon
+            <button className="mini-refresh" onClick={loadData} disabled={refreshing}>{refreshing?"checking…":"refresh now"}</button></div></div>
+        <div className="chips">
+          <div className="chip"><b style={{color:"var(--data)"}}>{nLarge}</b> large</div>
+          <div className="chip"><b style={{color:"var(--signal)"}}>{nMid}</b> mid</div>
+          <div className="chip"><b style={{color:"var(--warn)"}}>{nSmall}</b> small</div>
+          <div className="chip"><b>{nClears}</b> clear cost</div>
+        </div>
+      </header>
+
+      <section className="panel captabs">
+        {[["all","All 500"],["Large","Large cap"],["Mid","Mid cap"],["Small","Small cap"]].map(([k,l])=>(
+          <button key={k} className={"captab"+(capf===k?" on":"")} onClick={()=>setCapf(k)}
+            style={capf===k&&k!=="all"?{background:CAPCOLOR[k],borderColor:CAPCOLOR[k],color:"#06221d"}:null}>{l}</button>))}
+      </section>
+      <section className="panel bar">
+        <div className="filters">
+          {[["all","All"],["clears","Clears cost"],["stretched","Stretched >1.5σ"],["revert","Mean-reverting"]].map(([k,l])=>(
+            <button key={k} className={"fbtn"+(filter===k?" on":"")} onClick={()=>setFilter(k)}>{l}</button>))}
+        </div>
+        <div className="right">
+          <input className="search" placeholder="filter ticker…" value={q} onChange={e=>setQ(e.target.value)}/>
+          <label className="hz">Horizon {horizon}d<input type="range" min={1} max={30} value={horizon} onChange={e=>setHorizon(Number(e.target.value))}/></label>
+        </div>
+      </section>
+
+      <section className="panel tablewrap">
+        <table className="tbl"><thead><tr>
+          {COLS.map(c=>(<th key={c.k} className={c.k==="name"?"lft":""} onClick={()=>clickSort(c.k==="regime"?"regime":c.k)}>
+            {c.label}{(sortK===c.k)?(asc?" ▲":" ▼"):""}</th>))}
+        </tr></thead><tbody>
+          {pageRows.map(r=>(
+            <tr key={r.t} className={sel===r.t?"selrow":""} onClick={()=>setSel(sel===r.t?null:r.t)}>
+              {COLS.map(c=>{const acc=c.accent?c.accent(r):null;
+                return <td key={c.k} className={c.k==="name"?"lft name":""} style={acc?{color:acc}:null}>{c.fmt?c.fmt(r):r[c.k]}</td>;})}
+            </tr>))}
+        </tbody></table>
+        {filtered.length===0&&<div className="empty">No stocks match this filter.</div>}
+        {filtered.length>0&&<div className="pager">
+          <span className="pinfo">{filtered.length} match · showing {page*PAGE+1}–{Math.min((page+1)*PAGE,filtered.length)}</span>
+          <div className="pbtns">
+            <button disabled={page===0} onClick={()=>setPage(0)}>« first</button>
+            <button disabled={page===0} onClick={()=>setPage(page-1)}>‹ prev</button>
+            <span className="ppage">{page+1}/{pageCount}</span>
+            <button disabled={page>=pageCount-1} onClick={()=>setPage(page+1)}>next ›</button>
+            <button disabled={page>=pageCount-1} onClick={()=>setPage(pageCount-1)}>last »</button>
+          </div>
+        </div>}
+      </section>
+
+      {sel&&(()=>{const r=rows.find(x=>x.t===sel);return <Detail r={r} horizon={horizon}/>;})()}
+
+      <section className="panel data">
+        <div className="lbl">ADD / REPLACE A STOCK</div>
+        <div className="data-note">Paste one stock's data (closes per line, or date,O,H,L,C) to analyse it in the detail view below. For a live 50-name refresh, ask Claude to re-pull the set — in-browser fetch of 50 tickers is blocked by the sandbox.</div>
+        <Paster horizon={horizon}/>
+      </section>
+
+      <footer className="ft">Closed-form screen (fast) · Monte Carlo runs on the expanded stock only · probabilities are model outputs, not promises · <b>not investment advice</b>.</footer>
+      <ChatPanel ctx={chatCtx}/>
+    </div></div>);
+}
+
+function Detail({r,horizon}){
+  const mc=useMemo(()=>monteCarlo(r.S0,r.target,r.st.r,horizon),[r,horizon]);
+  const gbm=gbmProb(r.S0,r.target,r.meanDaily,r.sd,horizon);
+  const bars=r.closes.map((c,i)=>({c,h:r.H[i],l:r.L[i]}));
+  return (<section className="panel detail">
+    <div className="dhead"><div><span className="dname">{r.name}</span> <span className="dpx">₹{fmt(r.S0)}</span>
+      <span className="dtag" style={{color:r.trending?"var(--signal)":"var(--data)",borderColor:r.trending?"var(--signal)":"var(--data)"}}>{r.trending?"TRENDING":"MEAN-REVERTING"}</span></div>
+      <div className="dsub">target ₹{fmt(r.target)} ({sgn(r.tgtDist*100,1)}%) · {r.genuine?"OU mean-reversion level":"drift projection"}</div></div>
+    <div className="dgrid">
+      <div className="dcol">
+        <div className="lbl">PROBABILITY OF TOUCHING TARGET <span className="muted">{horizon}d</span></div>
+        <div className="bigrow"><span className="big">{pct(r.pTarget,0)}</span><span className="bigc">bootstrap<br/>95% CI {pct(r.pLo,0)}–{pct(r.pHi,0)}</span></div>
+        <div className="cibar"><div className="cifill" style={{left:(r.pLo*100)+"%",width:((r.pHi-r.pLo)*100)+"%"}}/><div className="cidot" style={{left:(r.pTarget*100)+"%"}}/></div>
+        <div className="mini">{(r.pHi-r.pLo)>0.06?"Wide band — even the simulation disagrees with itself; treat this as a rough lean.":"The simulation is stable across resamples."} Based on {r.nBars} trading days.
+        <b> What this CI is not:</b> it measures Monte-Carlo sampling noise only. It does NOT capture the bigger uncertainty — that the past year's return distribution may not describe the next {horizon} days. True forecast uncertainty is much wider than this band.</div>
+        <Fan S0={r.S0} tgt={r.target} bars={bars} horizon={horizon} mc={mc}/>
+        <div className="pb"><span>bootstrap (fat-tail) · headline</span><span style={{color:"var(--signal)"}}>{pct(mc.prob,0)}</span></div>
+        <div className="pb"><span>GBM closed-form (Gaussian)</span><span>{pct(gbm.touch,0)}</span></div>
+      </div>
+      <div className="dcol">
+        <div className="lbl">PRICE · 30d</div>
+        <PriceChart bars={bars} mean={r.meanPrice} band={r.band} tgt={r.target} S0={r.S0}/>
+        <div className="stwrap">
+          <Mini k="Ann vol" v={pct(r.volAnn,1)}/><Mini k="z vs mean" v={sgn(r.z)+"σ"}/>
+          <Mini k="Half-life" v={r.hl?fmt(r.hl,0)+"d":"—"}/><Mini k="Spread" v={r.spread==null?"—":pct(r.spread,2)}/>
+          <Mini k="P(up tmrw)" v={pct(r.hitUp,0)}/><Mini k="Tail" v={r.exk>1?"fat":"~norm"}/>
+        </div>
+      </div>
+    </div>
+    <div className="dgrid2">
+      <div className="dpanel">
+        <div className="lbl">TREND INTEGRITY <span className="muted">genuine vs fake</span></div>
+        <div className="trendbig" style={{color:r.trend.startsWith("Genuine ↑")?"var(--data)":r.trend.startsWith("Genuine ↓")?"var(--warn)":r.trend==="Mean-revert"?"var(--signal)":"var(--muted)"}}>{r.trend} <span className="tq">TQ {r.trendScore}/100</span></div>
+        <div className="stwrap4">
+          <Mini k="Efficiency ratio" v={fmt(r.er,2)}/><Mini k="Variance ratio" v={fmt(r.vr,2)}/>
+          <Mini k="Slope t-stat" v={sgn(r.slopeT,1)}/><Mini k="Trend R²" v={pct(r.r2,0)}/>
+        </div>
+        <div className="mini">{r.trend==="Choppy (fake)"?"High path length, little net move — a fake/whipsaw trend. Chasing it usually pays the spread repeatedly.":r.trend.startsWith("Genuine")?"Statistically significant slope + efficient move + persistent (VR>1) — a genuine directional trend.":r.trend==="Mean-revert"?"Variance ratio <1 / fast OU reversion — moves tend to snap back, not extend.":"No significant trend and no clear reversion — treat direction as noise."} ER: 1=clean trend, ~0=chop. VR: &gt;1 trending, &lt;1 mean-reverting. |t|&gt;2 = significant.</div>
+      </div>
+      <div className="dpanel">
+        <div className="lbl">VOLATILITY & RATIOS</div>
+        <div className="stwrap4">
+          <Mini k="Realised vol (1y)" v={pct(r.volAnn,0)}/><Mini k="Vol (last 30d)" v={pct(r.vol30,0)}/>
+          <Mini k="Parkinson vol" v={r.parkVol==null?"—":pct(r.parkVol,0)}/><Mini k="History" v={r.nBars+" days"}/>
+          <Mini k="EWMA vol" v={pct(r.ewVol,0)}/><Mini k={"Vol regime"} v={(r.volRegime>1.1?"rising ":r.volRegime<0.9?"falling ":"stable ")+"×"+fmt(r.volRegime,2)}/>
+          <Mini k="ATR %" v={pct(r.atr,1)}/><Mini k="Downside dev" v={pct(r.dDev,0)}/>
+          <Mini k="Max DD (45d)" v={pct(r.mdd,0)}/><Mini k="Sharpe (ann)" v={fmt(r.sharpe,2)}/>
+          <Mini k="Sortino" v={fmt(r.sortino,2)}/><Mini k="Beta vs NIFTY" v={r.beta==null?"—":fmt(r.beta,2)}/>
+          <Mini k="Corr NIFTY" v={r.corr==null?"—":fmt(r.corr,2)}/><Mini k="Skew / ex-kurt" v={sgn(r.skew,1)+"/"+sgn(r.exk,1)}/>
+        </div>
+        <div className="mini">Parkinson uses the high-low range (more efficient than close-to-close). EWMA weights recent days (λ0.94). Beta/corr vs NIFTY show market sensitivity. On ~45 days these are indicative, not precise.</div>
+      </div>
+    </div>
+  </section>);
+}
+function Mini({k,v}){return <div className="mini2"><span>{k}</span><b>{v}</b></div>;}
+
+function Paster({horizon}){
+  const [raw,setRaw]=useState("");const [nf,setNf]=useState(false);const [res,setRes]=useState(null);const [err,setErr]=useState("");
+  function go(){const p=parseInput(raw,nf);if(p.length<8){setErr("Need ~8+ rows.");setRes(null);return;}
+    if(p.some(b=>!isFinite(b.c)||b.c<=0)){setErr("Bad price found.");setRes(null);return;}
+    setErr("");const stock={t:"PASTED",d:"",c:p.map(b=>b.c),h:p.map(b=>b.h),l:p.map(b=>b.l)};
+    setRes(analyse(stock,horizon));}
+  return (<div>
+    <textarea value={raw} onChange={e=>setRaw(e.target.value)} spellCheck={false} placeholder={"164.86\n165.10\n…  or  2026-08-14,163.9,166.2,162.1,164.86"}/>
+    <label className="chkline"><input type="checkbox" checked={nf} onChange={e=>setNf(e.target.checked)}/> newest-first</label>
+    <div className="btns"><button className="go" onClick={go}>Analyse pasted</button></div>
+    {err&&<div className="err">{err}</div>}
+    {res&&<Detail r={res} horizon={horizon}/>}
+  </div>);
+}
+
+/* charts (compact) */
+function PriceChart({bars,mean,band,tgt,S0}){
+  const W=520,H=170,P={l:8,r:48,t:10,b:16};const cs=bars.map(b=>b.c);
+  let lo=Math.min(...cs,tgt,mean-band),hi=Math.max(...cs,tgt,mean+band);if(!(hi>lo))hi=lo+Math.max(1,Math.abs(lo)*0.01);
+  const xs=i=>P.l+i*(W-P.l-P.r)/(cs.length-1),ys=v=>P.t+(1-(v-lo)/(hi-lo))*(H-P.t-P.b);
+  const line=cs.map((c,i)=>`${i?"L":"M"}${xs(i).toFixed(1)},${ys(c).toFixed(1)}`).join("");
+  return <svg viewBox={`0 0 ${W} ${H}`} className="chart" preserveAspectRatio="none">
+    <rect x={P.l} y={ys(mean+band)} width={W-P.l-P.r} height={Math.abs(ys(mean-band)-ys(mean+band))} className="bandrect"/>
+    <line x1={P.l} y1={ys(mean)} x2={W-P.r} y2={ys(mean)} className="meanline"/>
+    <line x1={P.l} y1={ys(tgt)} x2={W-P.r} y2={ys(tgt)} className="tgtline"/>
+    <path d={line} className="pxline"/><circle cx={xs(cs.length-1)} cy={ys(S0)} r="3" className="dot"/>
+    <text x={W-P.r+4} y={ys(tgt)+3} className="ctxt" style={{fill:"var(--signal)"}}>{Math.round(tgt)}</text></svg>;
+}
+function Fan({S0,tgt,bars,horizon,mc}){
+  const W=520,H=140,P={l:8,r:46,t:8,b:8};const hist=bars.slice(-8).map(b=>b.c);const paths=mc.sample;
+  const allV=[S0,tgt,...hist,...paths.flatMap(p=>p.path)].filter(v=>isFinite(v));
+  let lo=Math.min(...allV),hi=Math.max(...allV);if(!(hi>lo))hi=lo+Math.max(1,Math.abs(lo)*0.01);
+  const total=hist.length-1+horizon,xs=i=>P.l+i*(W-P.l-P.r)/total,ys=v=>P.t+(1-(v-lo)/(hi-lo))*(H-P.t-P.b);
+  const start=hist.length-1;
+  return <svg viewBox={`0 0 ${W} ${H}`} className="chart" preserveAspectRatio="none">
+    <line x1={P.l} y1={ys(tgt)} x2={W-P.r} y2={ys(tgt)} className="tgtline"/>
+    {paths.map((p,i)=>{const d=p.path.map((v,j)=>`${j?"L":"M"}${xs(start+j)},${ys(v)}`).join("");
+      return <path key={i} d={d} fill="none" stroke={p.hit?"var(--signal)":"var(--muted-2)"} strokeOpacity={p.hit?0.32:0.13} strokeWidth="1"/>;})}
+    <path d={hist.map((c,i)=>`${i?"L":"M"}${xs(i)},${ys(c)}`).join("")} className="pxline"/>
+    <circle cx={xs(start)} cy={ys(S0)} r="3" className="dot"/>
+    <text x={W-P.r+4} y={ys(tgt)+3} className="ctxt" style={{fill:"var(--signal)"}}>tgt {Math.round(tgt)}</text></svg>;
+}
+
+
+/* ---------------- context builder + in-app chat (Anthropic API) ---------------- */
+function buildContext(rows,filtered,sel,capf,sortK,asc,horizon,asof){
+  const dir=asc?"ascending":"descending";
+  const capCounts="Large="+rows.filter(r=>r.cap==="Large").length+", Mid="+rows.filter(r=>r.cap==="Mid").length+", Small="+rows.filter(r=>r.cap==="Small").length;
+  const clears=rows.filter(r=>r.clears).length, stretched=rows.filter(r=>Math.abs(r.z)>1.5).length;
+  const g="Glossary: z=(spot-30d mean)/stdev (stretch). volAnn=annualised realised vol. target=OU mean-reversion level (half-life<=40d) else drift projection. Ptouch=probability price TOUCHES target within horizon, BOOTSTRAP of real returns (fat-tail aware), shown with a 95% CI that captures MONTE-CARLO SAMPLING NOISE ONLY (how stable the simulation is), NOT forecast uncertainty. Real uncertainty about the future is far wider than this band - never present the CI as the range the price will fall in. All stats now use ~1 YEAR of history (was 45 days), so vol/beta/probability estimates are materially tighter. TREND AUTHENTICITY: trend label = Genuine up/down vs Choppy(fake) vs Mean-revert vs Weak/Random; TQ=trend-quality score 0-100; ER=efficiency ratio (1 clean trend, ~0 chop); VR=variance ratio (>1 trending, <1 mean-reverting, ~1 random walk); slopeT=t-stat of log-price trend (|t|>2 significant). VOL: parkVol=high-low Parkinson vol; ewVol=EWMA(0.94); volRegime=EWMA/window vol (>1 rising); ATR%=avg true range; dDev=downside deviation; mdd=max drawdown 45d. RATIOS: sharpe, sortino (annualised, rf=0); beta & corr vs NIFTY. spread=Corwin-Schultz round-trip; clears=band exceeds ~2x ~29bps cost floor.";
+  const top=filtered.slice(0,20).map(r=>r.name+" ["+r.cap+"] spot=Rs"+r.S0.toFixed(1)+" z="+r.z.toFixed(2)+" vol="+(r.volAnn*100).toFixed(0)+"% target=Rs"+r.target.toFixed(1)+" delta="+(r.tgtDist*100).toFixed(1)+"% Ptouch="+(r.pTarget*100).toFixed(0)+"% trend="+r.trend+"(TQ"+r.trendScore+") ER="+r.er.toFixed(2)+" VR="+r.vr.toFixed(2)+" beta="+(r.beta==null?"NA":r.beta.toFixed(2))+" sharpe="+r.sharpe.toFixed(2)+" spread="+(r.spread==null?"NA":(r.spread*100).toFixed(2)+"%")+" "+(r.clears?"clears":"inside")).join("\n");
+  const sr=rows.find(r=>r.t===sel);
+  const selTxt=sr?("EXPANDED STOCK: "+sr.name+" ["+sr.cap+", "+sr.ind+"] spot=Rs"+sr.S0.toFixed(2)+" 30dMean=Rs"+sr.meanPrice.toFixed(2)+" z="+sr.z.toFixed(2)+" target=Rs"+sr.target.toFixed(2)+" ("+(sr.tgtDist*100).toFixed(1)+"%) Ptouch_bootstrap("+horizon+"d)="+(sr.pTarget*100).toFixed(0)+"% (95%CI "+(sr.pLo*100).toFixed(0)+"-"+(sr.pHi*100).toFixed(0)+"%, history "+sr.nBars+"d) Ptouch_gbm="+(sr.pGbm*100).toFixed(0)+"% | TREND: "+sr.trend+" TQ="+sr.trendScore+" ER="+sr.er.toFixed(2)+" VR="+sr.vr.toFixed(2)+" slopeT="+sr.slopeT.toFixed(1)+" R2="+(sr.r2*100).toFixed(0)+"% | VOL: realised="+(sr.volAnn*100).toFixed(0)+"% parkinson="+(sr.parkVol==null?"NA":(sr.parkVol*100).toFixed(0)+"%")+" ewma="+(sr.ewVol*100).toFixed(0)+"% volRegime="+sr.volRegime.toFixed(2)+" ATR="+(sr.atr*100).toFixed(1)+"% maxDD="+(sr.mdd*100).toFixed(0)+"% | RATIOS: sharpe="+sr.sharpe.toFixed(2)+" sortino="+sr.sortino.toFixed(2)+" beta="+(sr.beta==null?"NA":sr.beta.toFixed(2))+" corr="+(sr.corr==null?"NA":sr.corr.toFixed(2))+" halfLife="+(sr.hl?sr.hl.toFixed(0)+"d":"NA")+" spread="+(sr.spread==null?"NA":(sr.spread*100).toFixed(2)+"%")+" cost="+(sr.clears?"clears":"inside")):"(no stock expanded)";
+  return "AS OF "+asof+" (end-of-day snapshot). Probability horizon="+horizon+" trading days.\nUniverse: 500 NSE stocks ("+capCounts+"). "+clears+" clear the cost floor, "+stretched+" are stretched >1.5 sigma.\nCurrent view: cap filter="+capf+", sorted by "+sortK+" "+dir+", "+filtered.length+" stocks match.\n"+g+"\n"+selTxt+"\nTOP OF CURRENT VIEW (up to 20 rows):\n"+top;
+}
+
+function ChatPanel({ctx}){
+  const [open,setOpen]=useState(false);
+  const [msgs,setMsgs]=useState([]);
+  const [input,setInput]=useState("");
+  const [busy,setBusy]=useState(false);
+  const [err,setErr]=useState("");
+  const boxRef=React.useRef(null);
+  useEffect(()=>{if(boxRef.current)boxRef.current.scrollTop=boxRef.current.scrollHeight;},[msgs,busy]);
+  async function ask(text){
+    const q=(text!=null?text:input).trim(); if(!q||busy)return;
+    setInput(""); setErr("");
+    const hist=[...msgs,{role:"user",content:q}]; setMsgs(hist); setBusy(true);
+    const sys="You are a quantitative-analyst assistant embedded inside an NSE (Indian) stock screener. "+
+      "Answer the user's questions about the on-screen data using ONLY the CONTEXT below plus general finance knowledge. "+
+      "The data is an END-OF-DAY statistical snapshot - it is NOT live and NOT investment advice. "+
+      "Never invent numbers that are not in the context; if a figure isn't present, say so and suggest which cap tab, filter, or row would surface it. "+
+      "Be concise and precise; define terms simply when it helps. Do NOT give personalised buy/sell recommendations - explain what the metrics indicate and their caveats. Currency is INR (Rs).\n\nCONTEXT:\n"+ctx;
+    const models=["claude-sonnet-4-6","claude-sonnet-5"]; let done=false,lastErr="error";
+    for(const model of models){
+      try{
+        const res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({model,max_tokens:1000,system:sys,messages:hist.slice(-8).map(m=>({role:m.role,content:m.content}))})});
+        if(!res.ok){lastErr="api "+res.status;continue;}
+        const data=await res.json();
+        const t=(data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("\n").trim();
+        if(!t){lastErr="empty response";continue;}
+        setMsgs(m=>[...m,{role:"assistant",content:t}]); done=true; break;
+      }catch(e){lastErr=e.message;}
+    }
+    if(!done)setErr("Chat couldn't reach the model ("+lastErr+"). In-app chat uses the Anthropic API, which some viewers block - open the file in your own browser, or just ask me in the main Claude chat.");
+    setBusy(false);
+  }
+  const sugg=["Explain the z-score column","Which large caps look most stretched?","What does 'clears cost' mean?","Summarise the small-cap view"];
+  return React.createElement(React.Fragment,null,
+    !open&&<button className="chatfab" onClick={()=>setOpen(true)}>💬 Ask about this data</button>,
+    open&&<div className="chatpanel">
+      <div className="chathd"><span>Ask about the data</span><button onClick={()=>setOpen(false)} aria-label="close">✕</button></div>
+      <div className="chatbox" ref={boxRef}>
+        {msgs.length===0&&<div className="chathint">Ask anything about what's on screen. The assistant sees your current view and any expanded stock, and reads the real computed metrics (end-of-day, not live).<div className="sugg">{sugg.map((s,i)=><button key={i} onClick={()=>ask(s)}>{s}</button>)}</div></div>}
+        {msgs.map((m,i)=><div key={i} className={"cmsg "+m.role}>{m.content}</div>)}
+        {busy&&<div className="cmsg assistant busy">thinking…</div>}
+        {err&&<div className="cerr">{err}</div>}
+      </div>
+      <div className="chatin">
+        <input value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter")ask();}} placeholder="Ask about the data…"/>
+        <button onClick={()=>ask()} disabled={busy}>Send</button>
+      </div>
+    </div>
+  );
+}
+
+const CSS=`
+:root{--ink:#0d1420;--panel:#141d2c;--panel2:#101827;--grid:#243149;--text:#cdd8ea;--muted:#7285a3;--muted-2:#4c5c78;--data:#5fe3cf;--signal:#f2b45a;--warn:#e97a5c}
+*{box-sizing:border-box}
+.root{background:var(--ink);min-height:100vh;padding:20px;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:var(--text)}
+.wrap{max-width:1040px;margin:0 auto;display:flex;flex-direction:column;gap:13px;opacity:0;transform:translateY(6px);transition:.5s}
+.wrap.in{opacity:1;transform:none}
+.tk,.dpx,.big,.chart text,td,.search,textarea{font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace}
+.hd{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;border-bottom:1px solid var(--grid);padding-bottom:13px}
+.eyebrow{font-size:10px;letter-spacing:.2em;color:var(--muted);font-weight:600}
+.tk{font-size:27px;font-weight:600;margin-top:3px}.tkn{font-size:13px;color:var(--muted);margin-left:8px}
+.asof{font-size:11px;color:var(--muted);margin-top:3px}
+.chips{display:flex;gap:8px;flex-wrap:wrap}.chip{font-size:11px;color:var(--muted);border:1px solid var(--grid);border-radius:3px;padding:5px 9px}.chip b{color:var(--data);font-size:13px}
+.panel{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--grid);border-radius:6px;padding:14px}
+.captabs{display:flex;gap:8px;flex-wrap:wrap;padding:11px 14px}
+.captab{background:transparent;border:1px solid var(--grid);color:var(--muted);font-size:13px;padding:8px 16px;border-radius:5px;cursor:pointer;font-weight:600}
+.captab.on{background:var(--data);color:#06221d;border-color:var(--data)}
+.captab:hover:not(.on){color:var(--text);border-color:var(--muted)}
+.pager{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 8px 4px;flex-wrap:wrap}
+.pinfo{font-size:11px;color:var(--muted)}
+.pbtns{display:flex;gap:6px;align-items:center}
+.pbtns button{background:transparent;border:1px solid var(--grid);color:var(--muted);font-size:11px;padding:5px 9px;border-radius:4px;cursor:pointer}
+.pbtns button:hover:not(:disabled){color:var(--text);border-color:var(--muted)}.pbtns button:disabled{opacity:.35;cursor:default}
+.ppage{font-size:11px;color:var(--text);padding:0 6px}
+td.name{white-space:nowrap}
+.bar{display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap;align-items:center;padding:11px 14px}
+.filters{display:flex;gap:7px;flex-wrap:wrap}
+.fbtn{background:transparent;border:1px solid var(--grid);color:var(--muted);font-size:12px;padding:6px 11px;border-radius:4px;cursor:pointer}
+.fbtn.on{background:var(--data);color:#06221d;border-color:var(--data);font-weight:600}.fbtn:hover:not(.on){color:var(--text);border-color:var(--muted)}
+.right{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+.search{background:#0a111c;border:1px solid var(--grid);border-radius:4px;color:var(--text);padding:7px 10px;font-size:12px;outline:none;width:130px}
+.search:focus{border-color:var(--data)}
+.hz{font-size:11px;color:var(--muted);display:flex;align-items:center;gap:8px}.hz input{accent-color:var(--signal);width:110px}
+.tablewrap{padding:4px}
+.tbl{width:100%;border-collapse:collapse;font-size:12.5px}
+.tbl th{position:sticky;top:0;background:var(--panel2);color:var(--muted);font-weight:600;font-size:10px;letter-spacing:.06em;text-transform:uppercase;text-align:right;padding:10px 10px;cursor:pointer;user-select:none;border-bottom:1px solid var(--grid);white-space:nowrap}
+.tbl th.lft{text-align:left}.tbl th:hover{color:var(--text)}
+.tbl td{text-align:right;padding:9px 10px;border-bottom:1px solid rgba(36,49,73,.5);font-weight:500}
+.tbl td.lft{text-align:left}.tbl td.name{color:var(--text);font-weight:600;letter-spacing:.02em}
+.tbl tr{cursor:pointer}.tbl tbody tr:hover{background:rgba(95,227,207,.05)}
+.tbl tr.selrow{background:rgba(242,180,90,.09);outline:1px solid rgba(242,180,90,.3)}
+.empty{padding:20px;text-align:center;color:var(--muted);font-size:13px}
+.lbl{font-size:10px;letter-spacing:.16em;color:var(--muted);font-weight:600;text-transform:uppercase;margin-bottom:10px}.lbl .muted{color:var(--muted-2)}.muted{color:var(--muted)}
+.detail{border:1px solid rgba(242,180,90,.3)}
+.dhead{border-bottom:1px solid var(--grid);padding-bottom:10px;margin-bottom:12px}
+.dname{font-size:19px;font-weight:600}.dpx{font-size:17px;margin-left:8px}
+.dtag{font-size:9px;letter-spacing:.14em;font-weight:600;border:1px solid;border-radius:2px;padding:2px 7px;margin-left:10px}
+.dsub{font-size:12px;color:var(--muted);margin-top:5px}
+.dgrid{display:grid;grid-template-columns:1fr 1fr;gap:18px}@media(max-width:720px){.dgrid{grid-template-columns:1fr}}
+.bigrow{display:flex;align-items:baseline;gap:8px;margin-bottom:6px}.big{font-size:40px;font-weight:600;color:var(--signal)}.bigc{font-size:10px;letter-spacing:.16em;color:var(--muted)}
+.pb{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-top:8px;border-top:1px dashed var(--grid);padding-top:8px}
+.stwrap{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:10px}
+.mini2{background:#0a111c;border:1px solid var(--grid);border-radius:4px;padding:7px 9px;display:flex;flex-direction:column;gap:2px}
+.mini2 span{font-size:9px;color:var(--muted);letter-spacing:.04em}.mini2 b{font-size:13px}
+.chart{width:100%;height:auto;display:block;margin-top:2px}
+.pxline{fill:none;stroke:var(--data);stroke-width:1.6}.meanline{stroke:var(--muted);stroke-width:1;stroke-dasharray:2 3;opacity:.7}
+.tgtline{stroke:var(--signal);stroke-width:1;stroke-dasharray:4 3;opacity:.85}.bandrect{fill:rgba(114,133,163,.08)}
+.dot{fill:var(--data);stroke:var(--ink);stroke-width:1.5}.ctxt{font-size:9px;fill:var(--muted)}
+.data-note{font-size:11.5px;color:var(--muted);line-height:1.5;margin-bottom:10px;background:rgba(114,133,163,.06);padding:9px 11px;border-radius:4px}
+textarea{width:100%;min-height:72px;background:#0a111c;border:1px solid var(--grid);border-radius:4px;color:var(--text);font-size:12px;padding:10px;outline:none;resize:vertical;line-height:1.5}
+textarea:focus{border-color:var(--data)}
+.chkline{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--muted);margin-top:8px;cursor:pointer}.chkline input{accent-color:var(--data)}
+.btns{display:flex;gap:10px;margin-top:10px}.go{background:var(--data);color:#06221d;border:1px solid var(--data);font-weight:600;padding:8px 16px;border-radius:4px;cursor:pointer;font-size:12px}.go:hover{background:#7bece0}
+.err{color:var(--warn);font-size:12px;margin-top:8px}
+.ft{font-size:10.5px;color:var(--muted-2);text-align:center;line-height:1.6;padding:6px 0}.ft b{color:var(--muted)}
+button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--data);outline-offset:1px}
+.chatfab{position:fixed;bottom:18px;right:18px;background:var(--data);color:#06221d;border:none;border-radius:24px;padding:12px 18px;font-weight:600;font-size:13px;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.45);z-index:60}
+.chatfab:hover{background:#7bece0}
+.chatpanel{position:fixed;bottom:18px;right:18px;width:372px;max-width:calc(100vw - 24px);height:absolute;height:min(540px,calc(100vh - 36px));background:var(--panel);border:1px solid var(--grid);border-radius:10px;display:flex;flex-direction:column;box-shadow:0 12px 44px rgba(0,0,0,.55);z-index:60}
+.chathd{display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px solid var(--grid);font-size:13px;font-weight:600;color:var(--text)}
+.chathd button{background:none;border:none;color:var(--muted);font-size:15px;cursor:pointer}
+.chatbox{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px}
+.chathint{font-size:12px;color:var(--muted);line-height:1.55}
+.sugg{display:flex;flex-direction:column;gap:6px;margin-top:12px}
+.sugg button{text-align:left;background:#0a111c;border:1px solid var(--grid);color:var(--data);font-size:12px;padding:8px 10px;border-radius:6px;cursor:pointer}
+.sugg button:hover{border-color:var(--data)}
+.cmsg{font-size:12.5px;line-height:1.5;padding:9px 11px;border-radius:8px;white-space:pre-wrap;max-width:92%}
+.cmsg.user{background:var(--data);color:#06221d;align-self:flex-end;font-weight:500}
+.cmsg.assistant{background:#0a111c;border:1px solid var(--grid);color:var(--text);align-self:flex-start}
+.cmsg.busy{color:var(--muted);font-style:italic}
+.cerr{font-size:11.5px;color:var(--warn);background:rgba(233,122,92,.08);padding:8px 10px;border-radius:6px;line-height:1.5}
+.chatin{display:flex;gap:8px;padding:10px;border-top:1px solid var(--grid)}
+.chatin input{flex:1;background:#0a111c;border:1px solid var(--grid);border-radius:6px;color:var(--text);padding:9px 11px;font-size:12.5px;outline:none;font-family:inherit}
+.chatin input:focus{border-color:var(--data)}
+.chatin button{background:var(--data);color:#06221d;border:none;border-radius:6px;padding:0 16px;font-weight:600;font-size:12.5px;cursor:pointer}
+.chatin button:disabled{opacity:.5}
+.loadbox{margin-top:40px;text-align:center;padding:40px 20px}
+.loadmsg{font-size:14px;color:var(--muted);margin:14px 0;line-height:1.6;max-width:640px;margin-left:auto;margin-right:auto}
+.loadmsg.err{color:var(--warn)}
+.mini-refresh{background:transparent;border:1px solid var(--grid);color:var(--muted);font-size:10px;padding:3px 8px;border-radius:3px;cursor:pointer;margin-left:8px}
+.mini-refresh:hover:not(:disabled){color:var(--data);border-color:var(--data)}.mini-refresh:disabled{opacity:.5}
+.cibar{position:relative;height:8px;background:#0a111c;border:1px solid var(--grid);border-radius:4px;margin:10px 0 4px}
+.cifill{position:absolute;top:0;bottom:0;background:rgba(242,180,90,.35);border-radius:4px}
+.cidot{position:absolute;top:-3px;width:2px;height:14px;background:var(--signal)}
+.dgrid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}@media(max-width:720px){.dgrid2{grid-template-columns:1fr}}
+.dpanel{background:#0d1420;border:1px solid var(--grid);border-radius:6px;padding:13px}
+.trendbig{font-size:17px;font-weight:600;margin-bottom:10px}.tq{font-size:11px;color:var(--muted);font-weight:500;margin-left:6px}
+.stwrap4{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+@media(min-width:520px){.stwrap4{grid-template-columns:1fr 1fr}}
+@media(prefers-reduced-motion:reduce){.wrap{transition:none}}
+`;
+const root=ReactDOM.createRoot(document.getElementById("root"));
+root.render(React.createElement(App));
+
+</script></body></html>
